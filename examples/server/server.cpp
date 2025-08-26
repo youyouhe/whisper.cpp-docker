@@ -102,6 +102,7 @@ struct whisper_params {
     bool no_timestamps   = false;
     bool use_gpu         = true;
     bool flash_attn      = false;
+    int32_t gpu_device   = 0;  // CUDA device ID
     bool suppress_nst    = false;
     bool no_context      = false;
     bool no_language_probabilities = false;
@@ -178,6 +179,7 @@ void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & para
     fprintf(stderr, "  -nth N,    --no-speech-thold N [%-7.2f] no speech threshold\n",   params.no_speech_thold);
     fprintf(stderr, "  -nc,       --no-context        [%-7s] do not use previous audio context\n", params.no_context ? "true" : "false");
     fprintf(stderr, "  -ng,       --no-gpu            [%-7s] do not use gpu\n", params.use_gpu ? "false" : "true");
+    fprintf(stderr, "  --gpu-device N                 [%-7d] CUDA device ID to use\n", params.gpu_device);
     fprintf(stderr, "  -fa,       --flash-attn        [%-7s] flash attention\n", params.flash_attn ? "true" : "false");
     fprintf(stderr, "  -nlp,      --no-language-probabilities [%-7s] exclude language probabilities from verbose_json output\n", params.no_language_probabilities ? "true" : "false");
     // Voice Activity Detection (VAD) parameters
@@ -235,6 +237,7 @@ bool whisper_params_parse(int argc, char ** argv, whisper_params & params, serve
         else if (arg == "-oved" || arg == "--ov-e-device")     { params.openvino_encode_device = argv[++i]; }
         else if (arg == "-dtw"  || arg == "--dtw")             { params.dtw             = argv[++i]; }
         else if (arg == "-ng"   || arg == "--no-gpu")          { params.use_gpu         = false; }
+        else if (                  arg == "--gpu-device")         { params.gpu_device      = std::stoi(argv[++i]); }
         else if (arg == "-fa"   || arg == "--flash-attn")      { params.flash_attn      = true; }
         else if (arg == "-sns"  || arg == "--suppress-nst")    { params.suppress_nst    = true; }
         else if (arg == "-nth"  || arg == "--no-speech-thold") { params.no_speech_thold = std::stof(argv[++i]); }
@@ -643,6 +646,7 @@ int main(int argc, char ** argv) {
 
     cparams.use_gpu    = params.use_gpu;
     cparams.flash_attn = params.flash_attn;
+    cparams.gpu_device = params.gpu_device;
 
     if (!params.dtw.empty()) {
         cparams.dtw_token_timestamps = true;
@@ -995,16 +999,17 @@ int main(int argc, char ** argv) {
                 const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
                 std::string speaker = "";
 
-                if (params.diarize && pcmf32s.size() == 2)
-                {
-                    speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
-                }
-
                 ss << i + 1 + params.offset_n << "\n";
                 ss << to_timestamp(t0, true) << " --> " << to_timestamp(t1, true) << "\n";
-                ss << speaker << text << "\n\n";
+                ss << text << "\n\n";
             }
-            res.set_content(ss.str(), "application/x-subrip");
+            json jres = json{
+                {"code", 0},
+                {"msg", "ok"},
+                {"data", ss.str()}
+            };
+            res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
+                            "application/json");
         } else if (params.response_format == vtt_format) {
             std::stringstream ss;
 
@@ -1155,7 +1160,7 @@ int main(int argc, char ** argv) {
     svr->Get(sparams.request_path + "/health", [&](const Request &, Response &res){
         server_state current_state = state.load();
         if (current_state == SERVER_STATE_READY) {
-            const std::string health_response = "{\"status\":\"ok\"}";
+            const std::string health_response = "{\"status\":\"healthy\"}";
             res.set_content(health_response, "application/json");
         } else {
             res.set_content("{\"status\":\"loading model\"}", "application/json");
