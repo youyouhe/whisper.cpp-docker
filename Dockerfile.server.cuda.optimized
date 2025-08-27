@@ -1,0 +1,94 @@
+# 构建阶段 - 使用 CUDA 12.9.0
+FROM nvidia/cuda:12.9.0-devel-ubuntu20.04 AS builder
+
+# 避免交互式安装
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装编译依赖（这些很少变化，放在前面利用缓存）
+RUN apt-get update && \
+    apt-get install -y \
+        build-essential \
+        git \
+        wget \
+        pkg-config \
+        curl \
+        software-properties-common \
+        ffmpeg \
+        libfftw3-dev \
+        libfftw3-single3 \
+        libfftw3-double3 && \
+    rm -rf /var/lib/apt/lists/*
+
+# 安装 CMake（单独一层，如果 CMake 版本不变则不会重新安装）
+RUN wget -O - https://apt.kitware.com/keys/kitware-archive-latest.asc 2>/dev/null | gpg --dearmor - | tee /etc/apt/trusted.gpg.d/kitware.gpg >/dev/null && \
+    apt-add-repository 'deb https://apt.kitware.com/ubuntu/ focal main' && \
+    apt-get update && \
+    apt-get install -y cmake && \
+    rm -rf /var/lib/apt/lists/*
+
+# 创建工作目录
+WORKDIR /app
+
+# 先复制依赖文件（这些变化较少，可以更好地利用缓存）
+COPY CMakeLists.txt /app/
+COPY ggml/CMakeLists.txt /app/ggml/
+COPY src/CMakeLists.txt /app/src/
+COPY examples/CMakeLists.txt /app/examples/
+COPY examples/server/CMakeLists.txt /app/examples/server/
+
+# 先配置项目（这一步如果 CMakeLists 不变就不会重新执行）
+RUN cmake -B build \
+    -DGGML_CUDA=1 \
+    -DCMAKE_CUDA_ARCHITECTURES="61;75" \
+    -DWHISPER_BUILD_SERVER=ON \
+    -DCMAKE_BUILD_TYPE=Release
+
+# 复制源代码（源代码变化较多，放最后）
+COPY . /app
+
+# 只编译服务器（利用之前的配置缓存）
+RUN cmake --build build -j $(nproc) --target whisper-server
+
+# 运行阶段 - 使用 CUDA 12.9.0 运行时
+FROM nvidia/cuda:12.9.0-runtime-ubuntu20.04
+
+# 避免交互式安装
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 安装运行时依赖
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    libfftw3-single3 \
+    libfftw3-double3 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置环境变量
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
+ENV PATH=/usr/local/cuda/bin:$PATH
+
+# 创建非特权用户
+RUN useradd -m -u 1000 whisperuser
+USER whisperuser
+
+# 创建工作目录
+WORKDIR /app
+
+# 从构建阶段复制二进制文件
+COPY --from=builder /app/build/bin/whisper-server ./build/bin/whisper-server
+COPY --from=builder /app/models/download-ggml-model.sh ./models/download-ggml-model.sh
+COPY --from=builder /app/models/download-vad-model.sh ./models/download-vad-model.sh
+
+# 下载预训练模型
+RUN ./models/download-ggml-model.sh large-v3-turbo
+RUN ./models/download-vad-model.sh silero-v5.1.2
+
+# 暴露端口
+EXPOSE 8080
+
+# 健康检查
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD curl -f http://localhost:8080/health || exit 1
+
+# 启动命令
+CMD ["./build/bin/whisper-server", "-m", "models/ggml-large-v3-turbo.bin", "--vad", "-vm", "models/ggml-silero-v5.1.2.bin", "--gpu-device", "0", "-t", "4", "--port", "8080"]
