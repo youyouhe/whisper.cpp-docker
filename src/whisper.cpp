@@ -6682,7 +6682,8 @@ static bool whisper_vad(
 
         int silence_samples = 0.1 * WHISPER_SAMPLE_RATE;
         int total_silence_samples = (vad_segments->data.size() > 1) ? (vad_segments->data.size() - 1) * silence_samples : 0;
-        int total_samples_needed = filtered_n_samples + total_silence_samples;
+        // Add a small safety buffer to prevent potential buffer overflows
+        int total_samples_needed = filtered_n_samples + total_silence_samples + 16; // 16 sample safety buffer
 
         WHISPER_LOG_INFO("%s: total duration of speech segments: %.2f seconds\n",
                         __func__, (float)filtered_n_samples / WHISPER_SAMPLE_RATE);
@@ -6752,8 +6753,16 @@ static bool whisper_vad(
                 ctx->state->vad_segments.push_back(segment);
 
                 // Copy this speech segment
-                memcpy(filtered_samples.data() + offset, samples + segment_start_samples, segment_length * sizeof(float));
-                offset += segment_length;
+                // Add bounds checking to prevent buffer overflow
+                if (offset + segment_length <= (int)filtered_samples.size()) {
+                    memcpy(filtered_samples.data() + offset, samples + segment_start_samples, segment_length * sizeof(float));
+                    offset += segment_length;
+                } else {
+                    WHISPER_LOG_ERROR("%s: Buffer overflow prevented in speech segment copy. offset=%d, segment_length=%d, buffer_size=%zu\n", 
+                                    __func__, offset, segment_length, filtered_samples.size());
+                    whisper_vad_free_segments(vad_segments);
+                    return false;
+                }
 
                 // Add silence after this segment (except after the last segment)
                 if (i < (int)vad_segments->data.size() - 1) {
@@ -6769,8 +6778,16 @@ static bool whisper_vad(
                     state->vad_mapping_table.push_back({silence_end_vad, orig_silence_end});
 
                     // Fill with zeros (silence)
-                    memset(filtered_samples.data() + offset, 0, silence_samples * sizeof(float));
-                    offset += silence_samples;
+                    // Add bounds checking to prevent buffer overflow
+                    if (offset + silence_samples <= (int)filtered_samples.size()) {
+                        memset(filtered_samples.data() + offset, 0, silence_samples * sizeof(float));
+                        offset += silence_samples;
+                    } else {
+                        WHISPER_LOG_ERROR("%s: Buffer overflow prevented in silence segment. offset=%d, silence_samples=%d, buffer_size=%zu\n", 
+                                        __func__, offset, silence_samples, filtered_samples.size());
+                        whisper_vad_free_segments(vad_segments);
+                        return false;
+                    }
                 }
             }
         }
